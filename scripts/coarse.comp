@@ -1,0 +1,98 @@
+#version 430
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(std430, binding = 0) buffer OutBuf {
+    uint visible;
+    uint interior;
+    uint border;
+};
+layout(std430, binding = 1) buffer Counter {
+    uint fineCount;
+    uint _p0;
+    uint _p1;
+};
+layout(std430, binding = 2) buffer FineList {
+    uint cells[];
+};
+
+uniform int  N;
+uniform int  Nb;
+uniform uint maxFine;
+
+const float FOV_H      = radians(90.0);
+const float ASPECT     = 16.0 / 9.0;
+const float FOV_V      = 2.0 * atan(tan(FOV_H * 0.5) / ASPECT);
+const float HALF_FOV_H = FOV_H * 0.5;
+const float HALF_FOV_V = FOV_V * 0.5;
+const int   TILES_X    = 30;
+const int   TILES_Y    = 17;
+const float DX         = FOV_H / float(TILES_X);
+const float DY         = FOV_V / float(TILES_Y);
+
+void emitRecurse(int bi, int bj, int bk) {
+    uint slot = atomicAdd(fineCount, 1u);
+    if (slot < maxFine) {
+        cells[slot] = uint(bi) | (uint(bj) << 10) | (uint(bk) << 20);
+    }
+}
+
+void main() {
+    int bi = int(gl_GlobalInvocationID.x);
+    int bj = int(gl_GlobalInvocationID.y);
+    int bk = int(gl_GlobalInvocationID.z);
+    if (bi >= Nb || bj >= Nb || bk >= Nb) return;
+
+    float halfN = float(N) * 0.5;
+    const float B = 8.0;
+    vec3 base = vec3(float(bi)*B - halfN,
+                     float(bj)*B - halfN,
+                     float(bk)*B - halfN);
+
+    // 8 corners of the brick AABB
+    vec3 c[8];
+    c[0] = base;
+    c[1] = base + vec3(B, 0, 0);
+    c[2] = base + vec3(0, B, 0);
+    c[3] = base + vec3(0, 0, B);
+    c[4] = base + vec3(B, B, 0);
+    c[5] = base + vec3(B, 0, B);
+    c[6] = base + vec3(0, B, B);
+    c[7] = base + vec3(B, B, B);
+
+    // z-sign test: full reject if all behind, recurse if straddling
+    int posZ = 0;
+    for (int i = 0; i < 8; i++) if (c[i].z > 0.0) posZ++;
+    if (posZ == 0) return;                  // entirely behind camera
+    if (posZ < 8) { emitRecurse(bi, bj, bk); return; }
+
+    // angular bounds (atan(x/z), atan(y/z) are monotone -> corners give extremes)
+    float tx_min = 1e9, tx_max = -1e9;
+    float ty_min = 1e9, ty_max = -1e9;
+    for (int i = 0; i < 8; i++) {
+        float invz = 1.0 / c[i].z;
+        float tx = atan(c[i].x * invz);
+        float ty = atan(c[i].y * invz);
+        tx_min = min(tx_min, tx); tx_max = max(tx_max, tx);
+        ty_min = min(ty_min, ty); ty_max = max(ty_max, ty);
+    }
+
+    // entire angular range outside frustum -> REJECT
+    if (tx_max <= -HALF_FOV_H || tx_min >= HALF_FOV_H ||
+        ty_max <= -HALF_FOV_V || ty_min >= HALF_FOV_V) return;
+
+    // entirely inside frustum AND inside one tile -> FULL_INTERIOR
+    if (tx_min > -HALF_FOV_H && tx_max < HALF_FOV_H &&
+        ty_min > -HALF_FOV_V && ty_max < HALF_FOV_V) {
+        int ixmin = int((tx_min + HALF_FOV_H) / DX);
+        int ixmax = int((tx_max + HALF_FOV_H) / DX);
+        int iymin = int((ty_min + HALF_FOV_V) / DY);
+        int iymax = int((ty_max + HALF_FOV_V) / DY);
+        if (ixmin == ixmax && iymin == iymax) {
+            atomicAdd(visible,  512u);   // 8^3
+            atomicAdd(interior, 512u);
+            return;
+        }
+    }
+
+    emitRecurse(bi, bj, bk);
+}

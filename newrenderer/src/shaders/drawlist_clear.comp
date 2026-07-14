@@ -1,0 +1,55 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// Must match drawlist.comp / rasterize.comp.
+struct ChunkMeta {
+    uint startBatch;
+    uint batchCount;
+    uint lastBatchRowCount;
+    uint chunkID;
+};
+
+struct Job {
+    uint count;
+    uint id_per_tile;
+    uint tileID_flat;
+    uint pad0;
+    ChunkMeta list[MAX_JOB_CHUNKS]; // declared to keep stride consistent; not written here
+};
+
+struct DispatchHeader {
+    uint x_count;
+    uint y_count;
+    uint z_count;
+    uint pad0;
+    uint tip_pointers[NUM_PRIMARY_TILES];
+};
+
+layout(std430, binding = 2) coherent buffer GpuJobSSBO            { Job joblist[]; };
+layout(std430, binding = 5) coherent buffer GpuDispatchHeaderSSBO { DispatchHeader dh; };
+
+// Dispatch as ((NUM_PRIMARY_TILES + 63) / 64, 1, 1).
+//
+// Seeds one primary job per tile (job i := tile i), publishes each tile's
+// tip pointer to its primary job, and pre-bakes dispatch_x to NUM_PRIMARY_TILES
+// so the rasterize indirect dispatch starts from a non-zero count.
+// Binning's atomicAdd on dh.x_count then only counts overflow jobs on top.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+
+    if (i == 0u) {
+        dh.x_count = NUM_PRIMARY_TILES; // primaries are pre-allocated
+        dh.y_count = 1u;
+        dh.z_count = 1u;
+        dh.pad0    = 0u;
+    }
+
+    if (i >= NUM_PRIMARY_TILES) return;
+
+    joblist[i].count       = 0u;
+    joblist[i].id_per_tile = 0u;
+    joblist[i].tileID_flat = i;
+    joblist[i].pad0        = 0u;
+
+    dh.tip_pointers[i] = i;
+}

@@ -1,0 +1,74 @@
+void generateProceduralStarCache() {
+    std::vector<RawStar> procStars;
+
+    
+    glm::vec3 min{};
+    glm::vec3 max{};
+    for(size_t i = 0; i < 50 * 1'000'000; i++) {
+        RawStar s;
+        s.mMagnitude = rand_float(-10.0, 20.0);
+        s.mTEff = rand_float(2000.0, 12000.0);
+        glm::vec3 pos = generateBetterGalaxyStar();
+        //uniform box
+        //(glm::vec3(rand_float(), rand_float(), rand_float()) - 0.5f) * 2.0f * 32.f;
+
+        glm::ivec3 pos_rounded = pos;
+        glm::vec3 pos_local_offset = fract(pos);
+        pos_local_offset = glm::normalize(pos_local_offset);
+
+        //pos = glm::vec3(pos_rounded) + pos_local_offset;
+        
+        pos *= CHUNK_SIZE_PARSECS;
+        //pos.x *= 4.0;
+        //pos.y *= 1.8;
+        //pos.z *= 4.0;
+
+        s.mPosition = pos;
+        procStars.push_back(s);
+
+        min.x = std::min(min.x, pos.x);
+        min.y = std::min(min.y, pos.y);
+        min.z = std::min(min.z, pos.z);
+
+        max.x = std::max(max.x, pos.x);
+        max.y = std::max(max.y, pos.y);
+        max.z = std::max(max.z, pos.z);
+    }
+
+    std::cout << "min: " << glm::to_string(min) << std::endl;
+    std::cout << "max: " << glm::to_string(max) << std::endl;
+    glm::vec3 extents = max - min;
+    std::cout << "extents: " << glm::to_string(extents) << std::endl;
+
+    stars::writeStarCache("data/stars.cache", procStars);
+}
+
+void buildGaiaCache() {
+    std::string path = "data/gaia_full/binary_cache/";
+    
+    std::vector<RawStar> all_gaia_stars;
+
+    size_t file_counter = 0;
+
+    for (const auto & entry : std::filesystem::directory_iterator(path)) {
+        std::cout << entry.path() << std::endl; 
+        stars::readStarCache(entry.path().string(), all_gaia_stars);
+        std::cout << "################## TOTAL SIZE: " << all_gaia_stars.size() << std::endl;
+        std::cout << "################## FILES READ: " << file_counter++ << std::endl;
+        std::cout << "################## STARS PER FILE AVG: " << static_cast<double>(all_gaia_stars.size()) / static_cast<double>(file_counter) << std::endl;
+    }
+
+    stars::writeStarCache("data/full_gaia_stars.cache", all_gaia_stars);
+
+    return;
+}
+
+namespace {
+    float rand_float(
+    float const min = 0.f,
+    float const max = 1.f)
+{
+    static thread_local std::mt19937 gen(42);
+    static thread_local std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    return dist(gen) * (max - min) + min;
+}

@@ -1,0 +1,27 @@
+#version 460 core
+
+layout(local_size_x = 32, local_size_y = 1) in;
+layout(binding = 1, rgba8) uniform image2D uFrameBuffer;
+
+uniform ivec2 uResolution;
+uniform uint  uLineCount;
+uniform uint  uLineChars [32 * 8];   // unchanged: 32 lines × 32 chars, 4-per-uint
+
+#include "common/big_text.lib.comp"
+
+void main() {
+    uint lineNumber = gl_WorkGroupID.x;
+    uint i          = gl_LocalInvocationID.x;
+
+    // anchor in real pixel coords now (no more /4 hack)
+    const ivec2 textAnchor = ivec2(10, uResolution.y - 300);
+
+    uint wordIdx = lineNumber * 8u + (i >> 2);
+    uint shift   = (i & 3u) * 8u;
+    uint chr     = (uLineChars[wordIdx] >> shift) & 0xFFu;
+
+    ivec2 charLoc = textAnchor
+                  + ivec2( int(i)          * int(FONT_ADVANCE) * SCALE,
+                          -int(lineNumber) * int(LINE_HEIGHT)  * SCALE);
+    drawChar(chr, charLoc, vec4(1.0));
+}

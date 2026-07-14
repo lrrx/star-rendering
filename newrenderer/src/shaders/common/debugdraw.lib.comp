@@ -1,0 +1,57 @@
+void DEBUG_drawLine(ivec2 start, ivec2 end, vec4 color) {
+    vec2 x0 = start;
+    vec2 x1 = end;
+    float len = length(x1 - x0);
+    vec2 dir = normalize(x1 - x0);
+    for(int i = 0; i <= len; i++) {
+        ivec2 x = ivec2(x0 + dir * float(i));
+        if(x.x < 0 || x.y < 0 || x.x > uResolution.x - 1 || x.y > uResolution.y - 1) continue;
+        imageStore(uFrameBuffer, x, color);
+    }
+}
+
+void DEBUG_drawCross(ivec2 pos, int r, vec4 color) {
+    DEBUG_drawLine(pos + ivec2(-r, 0), pos + ivec2(r, 0), color);
+    DEBUG_drawLine(pos + ivec2(0, -r), pos + ivec2(0, r), color);
+}
+
+void DEBUG_draw2dBox(ivec2 pos, int r, bool useCross, vec4 color) {
+    for(uint j = 0; j < 4; j++) {
+        ivec2 offs0 = ivec2(uvec2(j % 2, j / 2) * r);
+        const uint indices[4] = uint[](1, 3, 0, 2);
+        uint j1 = indices[j];
+        ivec2 offs1 = ivec2(uvec2(j1 % 2, j1 / 2) * r);
+        if(useCross) {
+            DEBUG_drawCross(pos + offs0, r / 16, color);
+        }
+        else {
+            DEBUG_drawLine(pos + offs0, pos + offs1, color);
+        }
+    }
+}
+
+void DEBUG_fillPixelThick(uint size, ivec2 coord, vec4 color) {
+    for(int x = 0; x < size; x++) {
+        for(int y = 0; y < size; y++) {
+            imageStore(uFrameBuffer, coord + ivec2(x,y),
+                color
+            );
+        }
+    }
+}
+
+void DEBUG_drawCircle(ivec2 center, float radius, vec4 color)
+{
+    const int SEG = 32;                       // perimeter resolution
+    const float STEP = 6.2831853 / float(SEG); // 2π / SEG
+
+    ivec2 prev = center + ivec2(int(radius), 0);   // angle 0
+
+    for (int s = 1; s <= SEG; ++s) {
+        float a = float(s) * STEP;
+        ivec2 cur = center + ivec2(int(cos(a) * radius),
+                                   int(sin(a) * radius));
+        DEBUG_drawLine(prev, cur, color);
+        prev = cur;
+    }
+}

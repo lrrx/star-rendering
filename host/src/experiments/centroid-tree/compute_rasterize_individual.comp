@@ -1,0 +1,119 @@
+#version 460 core
+#extension GL_NV_shader_atomic_float : enable
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 1) buffer Stars {
+    uvec4 stars[];
+};
+
+layout(std430, binding = 2) buffer StarsMerged {
+    uvec4 starsMerged[];
+};
+
+layout(binding = 0, r32f) uniform image2D uColorBuffer;
+
+// Uniforms
+uniform mat4 uMatMV;
+uniform mat4 uMatP;
+uniform mat4 uInvMV;
+uniform mat4 uInvP;
+uniform mat4 uViewProj;
+uniform vec3 uColor;
+uniform bool uShowParent;
+
+uniform ivec2 uResolution;
+uniform vec3 uCameraPos;
+
+vec3 toScreen(vec3 pos) {
+    ivec2 ret = ivec2(-1);
+
+    // Clip Space
+    vec4 clip = vec4(0.0);
+    clip = uViewProj * vec4(pos, 1.0);
+
+    //if (clip.w <= 0.0) return ret;
+
+    // NDC
+    vec3 ndc = clip.xyz / clip.w;
+    /*if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0 || abs(ndc.z) > 1.0)
+        return ret;*/
+
+    // Pixel-Koordinaten
+    vec3 pixel;
+    pixel.x = ((ndc.x * 0.5 + 0.5) * float(uResolution.x));
+    pixel.y = ((ndc.y * 0.5 + 0.5) * float(uResolution.y));
+    pixel.z = (clip.w);
+
+
+    return pixel;
+}
+
+void DEBUG_drawLine(ivec2 start, ivec2 end, vec4 color) {
+    vec2 x0 = start;
+    vec2 x1 = end;
+    float len = length(x1 - x0);
+    vec2 dir = normalize(x1 - x0);
+    for(int i = 0; i <= len; i++) {
+        ivec2 x = ivec2(x0 + dir * float(i));
+        if(x.x < 0 || x.y < 0 || x.x > uResolution.x - 1 || x.y > uResolution.y - 1) continue;
+            
+        float p = float(i) / len;
+        float brightness = (p) * 0.5 + 0.2;
+
+        uint packedOut = packUnorm4x8(color.rgba * brightness);
+        float finalValue = uintBitsToFloat(packedOut);
+
+        imageAtomicExchange(uColorBuffer, x, finalValue);
+    }
+}
+
+vec3 dist_color(vec3 position, uint id) {
+    //vec3 id_color = unpackUnorm4x8(target_id * 99999).rgb;
+
+    uint dist_id = uint(length(position) / 10000.0) * 99999 + 0x4f325042;
+    vec3 color = unpackUnorm4x8(dist_id).xyz;
+
+    return normalize(color); 
+}
+
+vec3 decode_position(uvec3 p) {
+    return (vec3(p) / 1000.0) - 100000.0;
+}
+
+void main() {
+    uint id = gl_WorkGroupID.x; //TODO: use work group id here, not global id
+
+    uvec4 star = stars[id];
+    vec3 star_pos = decode_position(star.xyz);
+
+    ivec3 pixel = ivec3(toScreen(star_pos));
+    uint x = uint(pixel.x);
+    uint y = uint(pixel.y);
+    float z = pixel.z;
+
+    //if(pixel.x < 0) return;
+    if (x < 0 || x >= uResolution.x ||
+        y < 0 || y >= uResolution.y || z < 0.0)
+        return;
+
+    
+    uint target_id = star.w;
+    if(uShowParent && target_id > 0) {
+        uvec4 target_star = starsMerged[target_id];
+        vec3 target_pos = decode_position(target_star.xyz);
+        ivec3 target_pixel = ivec3(toScreen(target_pos));
+        if(z > 0.0) {
+            vec4 target_color = vec4(dist_color(target_pos, target_id), 1.0);
+            DEBUG_drawLine(pixel.xy, target_pixel.xy, target_color);
+        }
+    }
+
+    vec4 color = vec4(dist_color(star_pos, id) * 1.0, 1.0);
+
+    uint packedOut = packUnorm4x8(color.rgba);
+    float finalValue = uintBitsToFloat(packedOut);
+
+    //imageAtomicAdd(
+    imageAtomicExchange(uColorBuffer, pixel.xy, finalValue); 
+}

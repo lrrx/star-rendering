@@ -1,0 +1,467 @@
+#version 460 core
+
+layout(local_size_x = THREAD_COUNT, local_size_y = 1) in;
+
+layout(binding = 7) coherent buffer uInterleavedAccumulationBuffer {int accum[];};
+layout(binding = 1, rgba8) coherent uniform image2D uFrameBuffer;
+
+uniform mat4 uViewProj;
+uniform mat4 uInvP;
+uniform mat4 uMatModel;
+uniform ivec2 uResolution;
+uniform float uChunkSize;
+uniform vec3 uObserverPosWorld; // observer position in same coords/units as global_pos (parsecs)
+uniform float uTime;
+uniform float uParsecToMeter = 3.08567758e16;
+uniform bool uLumiThresholdEnabled;
+uniform float uLuminanceMultiplicator = 1e6;
+
+struct ChunkMeta {
+    uint startBatch;
+    uint batchCount;
+    uint lastBatchRowCount;
+    uint chunkID;
+};
+
+struct Job {
+    uint count;
+    uint id_per_tile;
+    uint tileID_flat;
+    uint pad0;
+    ChunkMeta list[MAX_JOB_CHUNKS];
+};
+
+layout(std430, binding = 2) readonly buffer GpuJobsSSBO {
+    Job joblist[];
+};
+
+layout(std430, binding = 0) readonly buffer GpuBatchesFlatSSBO {
+    uint batchesFlat[];
+};
+
+layout(std430, binding = 6) readonly buffer GpuHighPrecisionBatchesFlatSSBO {
+    uint highPrecisionBatchesFlat[];
+};
+
+layout(std430, binding = 4) buffer GpuProfilingSSBO {
+    uint profiling_StarsDrawn;
+    uint profiling_ChunksDrawn;
+    uint profiling_TilesDrawn;
+    uint profiling_StarsTotal;
+    uint profiling_JobCount;
+    uint profiling_WritesSharedClear; //writes for clearing tile
+    uint profiling_WritesShared;   // taps that hit the LDS tile
+    uint profiling_writesGlobalDirect;   // taps that fell through to addToFramebuffer
+    uint profiling_writesGlobalFlush; //framebuffer writes when flushing LDS tile
+};
+
+//costs performance measurably!
+
+//#define WRITE_PROFILING_COUNTERS //REVEAL(performance, profiling, memory, io)
+
+#ifdef WRITE_PROFILING_COUNTERS
+shared uint starsDrawn[THREAD_COUNT];
+shared uint starsTotal[THREAD_COUNT];
+shared uint writesSharedClear[THREAD_COUNT];
+shared uint writesShared[THREAD_COUNT];
+shared uint writesGlobalDirect[THREAD_COUNT];
+shared uint writesGlobalFlush[THREAD_COUNT];
+#endif
+
+//#define DEFINE_TEXT_ENABLED //REVEAL(text, overlay, screentiles)
+ 
+#ifdef DEFINE_TEXT_ENABLED
+#include "common/small_text.lib.comp"
+#endif
+
+void addToFramebuffer(ivec2 pixel, int tempLumi, int lumi) {
+    uint lane = gl_WorkGroupID.x % 2u;
+    uint fbOffsetFromLane = uResolution.y * lane;
+
+    uint index_base = (uResolution.x * pixel.y + pixel.x) * 2;
+
+    atomicAdd(accum[index_base + 0], tempLumi);
+    atomicAdd(accum[index_base + 1], lumi);
+}
+
+//#define RASTERIZE_USE_TILE_ACCUMULATION //REVEAL (tilebased rendering, accumulation, io)
+#ifdef RASTERIZE_USE_TILE_ACCUMULATION
+// [y][x] layout: word index = y*TILE_SIZE + x  ->  bank = x % 32.
+// x varies across lanes (and along an edge-on disk), so accesses spread across banks.
+shared int tileTemp[TILE_SIZE][TILE_SIZE]; // luminance-weighted temperature accum
+shared int tileLumi[TILE_SIZE][TILE_SIZE]; // luminance accum
+
+float rand(float n){
+    return abs(fract(sin(n) * 43758.5453123));
+}
+
+void clearTile() {
+    uint lid = gl_LocalInvocationID.x;
+    // 4096 cells / 512 threads = 16 cells per thread
+    for (uint i = lid; i < TILE_SIZE * TILE_SIZE; i += THREAD_COUNT) {
+        uint x = i % TILE_SIZE;          // consecutive lanes -> consecutive x -> distinct banks
+        uint y = i / TILE_SIZE;          // can be bit ops if TILE_SIZE is power of 2
+#ifdef WRITE_PROFILING_COUNTERS
+        writesSharedClear[gl_LocalInvocationID.x] += 1u;
+#endif
+        tileTemp[y][x] = 0;
+        tileLumi[y][x] = 0;
+    }
+}
+
+void flushTile(uvec2 tileBasePx) {
+    uint lid = gl_LocalInvocationID.x;
+    for (uint i = lid; i < TILE_SIZE * TILE_SIZE; i += THREAD_COUNT) {
+        uint x = i % TILE_SIZE;
+        uint y = i / TILE_SIZE;
+        ivec2 pixel = ivec2(x, y) + ivec2(tileBasePx);
+        if (pixel.x < uResolution.x && pixel.y < uResolution.y) {
+            int lumi = tileLumi[y][x];
+            if (lumi == 0) continue;
+            int tempAccumulated = tileTemp[y][x];
+#ifdef WRITE_PROFILING_COUNTERS
+            writesGlobalFlush[gl_LocalInvocationID.x] += 1u;
+#endif
+            addToFramebuffer(pixel, tempAccumulated, lumi);
+        }
+    }
+}
+
+#endif
+
+/////COSMOSCOUT CODE/////
+#include "common/cosmoscout_snippets.lib.comp"
+
+#include "common/unpack_uvec4.lib.comp"
+
+vec3 decode_morton(uint morton) {
+    uint x = morton;
+    uint y = morton >> 1;
+    uint z = morton >> 2;
+    x &=                   0x09249249u;
+    x = (x ^ (x >>  2)) &  0x030c30c3u;
+    x = (x ^ (x >>  4)) &  0x0f00f00fu;
+    x = (x ^ (x >>  8)) &  0xff0000ffu;
+    x = (x ^ (x >> 16)) &  0x0000ffffu;
+    y &=                   0x09249249u;
+    y = (y ^ (y >>  2)) &  0x030c30c3u;
+    y = (y ^ (y >>  4)) &  0x0f00f00fu;
+    y = (y ^ (y >>  8)) &  0xff0000ffu;
+    y = (y ^ (y >> 16)) &  0x0000ffffu;
+    z &=                   0x09249249u;
+    z = (z ^ (z >>  2)) &  0x030c30c3u;
+    z = (z ^ (z >>  4)) &  0x0f00f00fu;
+    z = (z ^ (z >>  8)) &  0xff0000ffu;
+    z = (z ^ (z >> 16)) &  0x0000ffffu;
+    return vec3(x, y, z) / float(0x3ff);
+}
+
+/*vec3 decodeStarPosition(uint p) {
+    uvec3 posUint = uvec3(
+        (p >> 20) & 0x3ff,
+        (p >> 10) & 0x3ff,
+        (p >>  0) & 0x3ff
+    );
+
+    return vec3(posUint) / float(0x3ff);
+}*/
+
+uvec3 unpackVec10(uint v) {
+    return uvec3(
+        (v >> 20u) & 0x3FFu,
+        (v >> 10u) & 0x3FFu,
+        (v >>  0u) & 0x3FFu
+    );
+}
+
+vec3 decodeFull(uint lowPrecision, uint midPrecision, uint highPrecision) {
+    uvec3 r = unpackVec10(lowPrecision);
+    r = (r << 10u) + unpackVec10(midPrecision); //REVEAL(LOD,precision) *50 factor to exaggerate
+    r = (r <<  4u) + unpackVec10(highPrecision);
+    return vec3(r) / float(1u << 24u);  //16777216.0 aka 2^24 (float32 mantissa bits)
+}
+
+vec3 toScreen(vec3 pos) {
+    vec3 ret = vec3(-1);
+
+    // Clip Space
+    vec4 clip = vec4(0.0);
+    clip = uViewProj * uMatModel * vec4(pos * uParsecToMeter, 1.0); //TODO: premultiply uMatModel * uViewProj? need to be careful with relation to uInvP tho
+
+    if (clip.w <= 0.0) return ret;
+
+    // NDC
+    vec3 ndc = clip.xyz / clip.w;
+
+
+    
+    if (abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0 || abs(ndc.z) > 1.0)
+        return ret;
+
+    // Pixel-Koordinaten
+    vec3 pixel;
+    pixel.x = float((ndc.x * 0.5 + 0.5) * float(uResolution.x));
+    pixel.y = float((ndc.y * 0.5 + 0.5) * float(uResolution.y));
+    pixel.z = ndc.z;
+
+    if (pixel.x < 0 || pixel.x >= uResolution.x ||
+        pixel.y < 0 || pixel.y >= uResolution.y)
+        return ret;
+
+    return pixel;
+}
+
+void writePixel(ivec2 tile_local_pos, ivec2 pixel, float temp, float lumi) {
+    int tempLumiInt = int(temp * lumi * 10000000.0 * uLuminanceMultiplicator);
+    int lumiInt = int(lumi * 10000000.0 * uLuminanceMultiplicator);
+
+#ifdef RASTERIZE_USE_TILE_ACCUMULATION
+    if (
+        tile_local_pos.x >= 0  && tile_local_pos.y >= 0  &&
+        tile_local_pos.x < TILE_SIZE && tile_local_pos.y < TILE_SIZE
+    ) {
+        uvec2 p = uvec2(tile_local_pos);
+#ifdef WRITE_PROFILING_COUNTERS
+        writesShared[gl_LocalInvocationID.x] += 1u;
+#endif
+        atomicAdd(tileTemp[p.y][p.x], tempLumiInt);
+        atomicAdd(tileLumi[p.y][p.x], lumiInt);
+        return;
+    }
+#endif
+#ifdef WRITE_PROFILING_COUNTERS
+    writesGlobalDirect[gl_LocalInvocationID.x] += 1u;
+#endif
+    addToFramebuffer(pixel, tempLumiInt, lumiInt);
+}
+
+//PERF:
+/* replacing WritePixel by:
+void writePixel(ivec2 tile_local_pos, ivec2 pixel, float temp, float lumi) {
+    if (tile_local_pos.x >= 0 && tile_local_pos.y >= 0 &&
+        tile_local_pos.x < TILE_SIZE && tile_local_pos.y < TILE_SIZE) {
+        uvec2 p = uvec2(tile_local_pos);
+        localTile[p.x * 2 + 0][p.y] = temp * lumi;   // non-atomic
+        localTile[p.x * 2 + 1][p.y] = lumi;          // non-atomic
+    }
+}
+
+gives much better performance at top-down 0° vs 90° down-view (normally 5x extra)
+can this be fixed by reintroducing morton order?
+the stars are being sorted by morton yes, but the gpu-thread stacking doesnt follow this order */
+//REVEAL (look at commit history to find point where this was still happening and isolate, worst-case view, rasterization, tilebased)
+
+mat3 rotY(float a) {
+    float c = cos(a), s = sin(a);
+    return mat3(
+        vec3( c, 0,-s),
+        vec3( 0, 1, 0),
+        vec3( s, 0, c)
+    );
+}
+
+
+// Decode magnitude from upper 16 bits
+float decodeMag(uint magTemp)
+{
+    uint magEnc = magTemp >> 16;          // upper 16 bits
+    float f = float(magEnc) / 65535.0;    // back to [0,1]
+    return f * 30.0 - 10.0;               // undo (mag + 10) / 30
+}
+
+// Decode temperature from lower 16 bits
+float decodeTemp(uint magTemp)
+{
+    uint tempEnc = magTemp & 0xFFFFu;     // lower 16 bits
+    return float(tempEnc);                // direct mapping
+}
+
+uint drawStar(uint posEncoded, uint posEncodedHighPrecision, vec3 chunkGlobalPos, uvec2 tileBasePx, float absMag, float temp, float chunkScale) {
+    vec3 local_pos = vec3(decodeFull(posEncoded, posEncodedHighPrecision, 0).xyz); //REVEAL(morton vs. 10-10-10 packed)
+    vec3 global_pos = (local_pos + chunkGlobalPos) * uChunkSize * chunkScale;
+
+    //if(length(global_pos) > 250.0) return 0;
+    //global_pos.y /= 5.0;
+    //global_pos += uTime * local_pos * 100.0;
+    //global_pos = rotY((uTime * 5.0 + 0.0) / pow(length(global_pos), 1.5) * 1000.0) * global_pos;
+    vec3 pixel_and_depth = toScreen(global_pos);
+
+    ivec2 screen_pos = ivec2(pixel_and_depth.xy);
+    if(
+        screen_pos.x < 0 || screen_pos.y < 0 ||
+        screen_pos.x > uResolution.x - 1|| screen_pos.y > uResolution.y - 1
+    ) return 0;
+
+    // FIX 1: real 3D distance to observer (in parsecs, matching global_pos units)
+    float observer_distance = length(global_pos - uObserverPosWorld);
+    // FIX 2: feed getSolidAngleOfPixel NDC coords in [-1, 1], not [0, 1]
+    vec2 ndc_xy = (pixel_and_depth.xy / vec2(uResolution)) * 2.0 - 1.0;
+    vec3 screenSpacePos = vec3(ndc_xy, pixel_and_depth.z);
+
+    float solidAngle = getSolidAngleOfPixel(vec4(screenSpacePos, 1.0), uResolution, uInvP);
+    float apparentMagnitude = getApparentMagnitude(absMag, observer_distance);
+
+    float lumi = magnitudeToLuminance(apparentMagnitude, solidAngle);
+
+    ivec2 pixel = screen_pos;
+
+    ////////////////////////////////////////////
+    ivec2 outSize           = uResolution;
+    vec2  starCoords        = (pixel_and_depth.xy) - 0.5;
+    ivec2 integerStarCoords = ivec2(floor(starCoords));
+
+#ifdef ENABLE_LUMI_THRESHOLD
+    if(lumi < 0.0000000002) { //use rand to drop 99% for mem write distinction
+        ivec2 tile_local_pos = integerStarCoords - ivec2(tileBasePx);
+        writePixel(tile_local_pos, integerStarCoords, temp, lumi);
+        return 1;
+    }
+#endif
+
+    // Compute the fractional part of the star coordinates.
+    vec2 starWeights = fract(starCoords);
+
+    ivec2 targetStarCoords[4] = {
+    integerStarCoords,
+    integerStarCoords + ivec2(1, 0),
+    integerStarCoords + ivec2(0, 1),
+    integerStarCoords + ivec2(1, 1)
+    };
+
+
+    // Linear interpolation weights for the four nearest pixels.
+    float weights[4] = {(1 - starWeights.x) * (1 - starWeights.y),
+        starWeights.x * (1 - starWeights.y), (1 - starWeights.x) * starWeights.y,
+        starWeights.x * starWeights.y};
+    ////////////////////////////////////////////
+    
+    for(uint px = 0; px < 4; px++) {
+        ivec2 tile_local_pos = targetStarCoords[px] - ivec2(tileBasePx);
+        writePixel(tile_local_pos, targetStarCoords[px], temp, lumi * weights[px]);
+    }
+
+    return 1;
+}
+
+uint draw(uint jobID, uvec2 tileBasePx) {
+    uint columnID   = gl_LocalInvocationID.x;
+    uint chunkCount = min(joblist[jobID].count, uint(MAX_JOB_CHUNKS));
+    uint chunksTouched = 0u;
+
+    for (uint i = 0u; i < chunkCount; ++i) {
+        ChunkMeta meta = joblist[jobID].list[i];
+        vec3 chunkGlobalPos = vec3(unpack_uvec4(meta.chunkID).yzw) - vec3(127);
+        float chunkScale = float(uint(meta.chunkID >> 24) & 0x7F);
+        bool renderInHighPrecision = ((meta.chunkID >> 31) == 1u);
+        bool touched = false;
+
+        for (uint localRow = 0u; localRow < meta.batchCount; ++localRow) {
+            uint absRow      = meta.startBatch + localRow;
+            uint rowStartPtr = absRow * THREAD_COUNT * 2u;
+            uint highPrecisionRowStartPtr = absRow * THREAD_COUNT;
+
+            uint posEncoded     = batchesFlat[rowStartPtr + columnID * 2u + 0u];
+            uint magTempEncoded = batchesFlat[rowStartPtr + columnID * 2u + 1u];
+            uint posEncodedHighPrecision = 0;
+
+            if(renderInHighPrecision) {
+                //just for testing, put back to writing the highp
+                posEncodedHighPrecision = highPrecisionBatchesFlat[highPrecisionRowStartPtr + columnID];
+                
+            }
+
+            float mag  = decodeMag(magTempEncoded);
+            float temp = decodeTemp(magTempEncoded);
+#ifdef WRITE_PROFILING_COUNTERS
+            starsTotal[gl_LocalInvocationID.x] += 1u;
+#endif
+            if (posEncoded == 0xFFFFFFFFu) continue; // padding star //REVEAL(waste of memory fetches if preprocessing doesnt redistribute padding stars into less dense chunks, see c++ preprocessing::run side too)
+
+            uint wasStarAdded = drawStar(posEncoded, posEncodedHighPrecision, chunkGlobalPos, tileBasePx, mag, temp, chunkScale);
+#ifdef WRITE_PROFILING_COUNTERS
+    starsDrawn[gl_LocalInvocationID.x] += wasStarAdded;
+#endif
+            touched = true;
+        }
+        if (touched) chunksTouched++;
+    }
+    return chunksTouched;
+}
+
+void main() {
+    if(gl_GlobalInvocationID.x == 0) profiling_JobCount = gl_NumWorkGroups.x;
+
+    uint jobID       = gl_WorkGroupID.x;
+    if (jobID >= MAX_JOBS) return; // safety: x_count may overshoot the job buffer
+    uint tileID_flat = joblist[jobID].tileID_flat;
+
+    uvec2 tileID     = uvec2(tileID_flat % TILES_X, tileID_flat / TILES_X);
+    uvec2 tileBasePx = tileID * TILE_SIZE;
+
+#ifdef WRITE_PROFILING_COUNTERS
+    starsDrawn[gl_LocalInvocationID.x] = 0;
+    starsTotal[gl_LocalInvocationID.x] = 0;
+    writesSharedClear[gl_LocalInvocationID.x] = 0;
+    writesShared[gl_LocalInvocationID.x] = 0;
+    writesGlobalDirect[gl_LocalInvocationID.x] = 0;
+    writesGlobalFlush[gl_LocalInvocationID.x] = 0;
+#endif
+
+#ifdef RASTERIZE_USE_TILE_ACCUMULATION
+    clearTile();
+    barrier();
+#endif
+
+    uint chunksDrawn = (joblist[jobID].count > 0u) ? draw(jobID, tileBasePx) : 0u;
+
+    // flush to output image: 4096 pixels / 512 threads = 16 pixels per thread
+#ifdef RASTERIZE_USE_TILE_ACCUMULATION
+    barrier(); //TODO: do we really need this?
+    flushTile(tileBasePx);
+#endif
+
+#ifdef WRITE_PROFILING_COUNTERS
+    //barrier(); //to prevent in flushtile counter update
+    if(gl_LocalInvocationID.x > 0) return;
+    uint sumStarsDrawn = 0; for(uint i = 0; i < THREAD_COUNT; i++) sumStarsDrawn += starsDrawn[i];
+    uint sumStarsTotal = 0; for(uint i = 0; i < THREAD_COUNT; i++) sumStarsTotal += starsTotal[i];
+    uint sumWritesSharedClear = 0; for(uint i = 0; i < THREAD_COUNT; i++) sumWritesSharedClear += writesSharedClear[i];
+    uint sumWritesShared = 0; for(uint i = 0; i < THREAD_COUNT; i++) sumWritesShared += writesShared[i];
+    uint sumWritesGlobalDirect = 0; for(uint i = 0; i < THREAD_COUNT; i++) sumWritesGlobalDirect += writesGlobalDirect[i];
+    uint sumWritesGlobalFlush = 0; for(uint i = 0; i < THREAD_COUNT; i++) sumWritesGlobalFlush += writesGlobalFlush[i];
+
+    atomicAdd(profiling_WritesSharedClear, sumWritesSharedClear);
+    atomicAdd(profiling_WritesShared, sumWritesShared);
+    atomicAdd(profiling_writesGlobalDirect, sumWritesGlobalDirect);
+    atomicAdd(profiling_writesGlobalFlush, sumWritesGlobalFlush);
+
+    atomicAdd(profiling_StarsDrawn,  sumStarsDrawn);
+    atomicAdd(profiling_ChunksDrawn, chunksDrawn);
+    atomicAdd(profiling_TilesDrawn, 1u);
+    atomicAdd(profiling_StarsTotal, sumStarsTotal);
+#endif
+
+    /*uvec2 tileTopBase = uvec2(0, TILE_SIZE - (BLIT32_HEIGHT + 1) * 2) + tileBasePx;
+    uvec2 put = tileTopBase + uvec2(0, 0) * uvec2(BLIT32_WIDTH + 1, BLIT32_HEIGHT + 1); // was: -id_per_tile (field removed; jobs are per-slice now)
+    //drawInt(int(joblist[drawListPick_ID].count), ivec2(put), true);
+    drawInt(int(sumStarsDrawn / 100), ivec2(put) + ivec2(0, 0), false);
+    drawInt(int(sumStarsTotal / 100), ivec2(put) + ivec2(32, 0), false)*/;
+
+    /*uint chunks_in_draw_list = joblist[tileID_flat].count;
+    if(gl_LocalInvocationID == 0) {
+        uint x = tileBasePx.x;
+        uint y = tileBasePx.y;
+        const vec4 c = vec4(1.0);
+
+        drawChar(84, ivec2(x + 0,y), c); drawChar(58, ivec2(x + 6, y), c); drawInt(int(tileID_flat), ivec2(x + 12, y), false);          y+=BLIT32_HEIGHT + 1;
+        drawChar(67, ivec2(x + 0,y), c); drawChar(58, ivec2(x + 6, y), c); drawInt(int(chunks_in_draw_list), ivec2(x + 12, y), false);  y+=BLIT32_HEIGHT + 1;
+
+        drawInt(int(joblist[tileID_flat].list[0]), ivec2(tileBasePx) + ivec2(40, 0), false);
+        /*for(uint i = 0; i < 32 * 8; i++) {
+            uint val = 0;
+            if(i < chunks_in_draw_list) val = 1;
+            uvec2 p = tileBasePx + uvec2(40, 10) + uvec2(i / 32, i % 32);
+            imageAtomicAdd(uFrameBuffer, ivec2(p), val * 100u);
+        }
+    }*/
+}

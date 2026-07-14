@@ -1,0 +1,17 @@
+--settings=../share/config/simple_desktop.json -vistaini vista.ini
+
+- split by rows, not by chunks in draw list generation
+- should give way better load balacing without architectural change
+
+
+
+
+
+smaller tiles, smaller chunks
+same-position merging
+multiple z-layers in local tile / framebuffer, merge-accumulate
+increase star density
+buildGaiaCache in history
+fix missing gaia tiles
+shader recompile on enable/disable debug overlays
+support for defines (non-values just #DEFINE_ENABLE_XYZ)

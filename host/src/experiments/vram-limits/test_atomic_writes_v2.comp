@@ -1,0 +1,126 @@
+#version 460 core
+#extension GL_NV_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r32f) uniform image2D uColorBuffer;
+uniform ivec2 uResolution;
+
+// using uint shared tile for integer atomics on flush
+shared uint sTile[64][64];
+
+void main() {
+    ivec2 localID   = ivec2(gl_LocalInvocationID.xy);
+    ivec2 tileBase  = ivec2(gl_WorkGroupID.xy * 64);
+    uint  threadIdx = uint(localID.y * 16 + localID.x);
+
+    uint globalHash = uint(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16 + 256);
+    globalHash ^= globalHash >> 16;
+    globalHash *= 0x45d9f3bu;
+    globalHash ^= globalHash >> 16;
+
+    // clear - each thread clears its 16 owned pixels
+    uint base = threadIdx * 16u;
+    for (int i = 0; i < 16; i++) {
+        uint flat_val = base + uint(i);
+        sTile[flat_val >> 6][flat_val & 63u] = 0u;
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    // private registers - no atomics, no shared memory during accumulation
+    float private0  = 0.0, private1  = 0.0, private2  = 0.0, private3  = 0.0;
+    float private4  = 0.0, private5  = 0.0, private6  = 0.0, private7  = 0.0;
+    float private8  = 0.0, private9  = 0.0, private10 = 0.0, private11 = 0.0;
+    float private12 = 0.0, private13 = 0.0, private14 = 0.0, private15 = 0.0;
+
+    // increased iteration count - more stars per tile, better stress test
+    for (int i = 0; i < 8192; i++) {
+        uint hash = uint(localID.x + localID.y * 16 + i * 256);
+        hash ^= globalHash;
+        hash ^= hash >> 16;
+        hash *= 0x45d9f3bu;
+        hash ^= hash >> 16;
+
+        uint flatTarget = hash & 4095u;
+        uint owner      = flatTarget >> 4;
+        uint localSlot  = flatTarget & 15u;
+
+        if (owner == threadIdx) {
+            switch (localSlot) {
+                case  0: private0  += 1.0; break;
+                case  1: private1  += 1.0; break;
+                case  2: private2  += 1.0; break;
+                case  3: private3  += 1.0; break;
+                case  4: private4  += 1.0; break;
+                case  5: private5  += 1.0; break;
+                case  6: private6  += 1.0; break;
+                case  7: private7  += 1.0; break;
+                case  8: private8  += 1.0; break;
+                case  9: private9  += 1.0; break;
+                case 10: private10 += 1.0; break;
+                case 11: private11 += 1.0; break;
+                case 12: private12 += 1.0; break;
+                case 13: private13 += 1.0; break;
+                case 14: private14 += 1.0; break;
+                case 15: private15 += 1.0; break;
+            }
+        }
+    }
+
+    // write private registers to shared as uint (fixed-point, scale 1:1 here)
+    // in the real rasterizer use a meaningful scale factor e.g. * 1024.0
+    sTile[(base +  0u) >> 6][(base +  0u) & 63u] = uint(private0);
+    sTile[(base +  1u) >> 6][(base +  1u) & 63u] = uint(private1);
+    sTile[(base +  2u) >> 6][(base +  2u) & 63u] = uint(private2);
+    sTile[(base +  3u) >> 6][(base +  3u) & 63u] = uint(private3);
+    sTile[(base +  4u) >> 6][(base +  4u) & 63u] = uint(private4);
+    sTile[(base +  5u) >> 6][(base +  5u) & 63u] = uint(private5);
+    sTile[(base +  6u) >> 6][(base +  6u) & 63u] = uint(private6);
+    sTile[(base +  7u) >> 6][(base +  7u) & 63u] = uint(private7);
+    sTile[(base +  8u) >> 6][(base +  8u) & 63u] = uint(private8);
+    sTile[(base +  9u) >> 6][(base +  9u) & 63u] = uint(private9);
+    sTile[(base + 10u) >> 6][(base + 10u) & 63u] = uint(private10);
+    sTile[(base + 11u) >> 6][(base + 11u) & 63u] = uint(private11);
+    sTile[(base + 12u) >> 6][(base + 12u) & 63u] = uint(private12);
+    sTile[(base + 13u) >> 6][(base + 13u) & 63u] = uint(private13);
+    sTile[(base + 14u) >> 6][(base + 14u) & 63u] = uint(private14);
+    sTile[(base + 15u) >> 6][(base + 15u) & 63u] = uint(private15);
+
+    barrier();
+    memoryBarrierShared();
+
+    // flush - subgroup-reduce first, then one global atomic per subgroup
+    // subgroup size is typically 32 on Ada, so 8 subgroups per workgroup
+    // each subgroup handles a contiguous range of pixels
+    /*for (int i = 0; i < 16; i++) {
+        int  flatIdx   = int(threadIdx) * 16 + i;
+        uint tileVal   = sTile[flatIdx >> 6][flatIdx & 63];
+        
+        // subgroup add: one lane accumulates the whole warp's contribution
+        // to this pixel - reduces 32 global atomics to 1 per pixel per subgroup
+        uint reduced   = subgroupAdd(tileVal);
+
+        ivec2 pixel = tileBase + ivec2(flatIdx & 63, flatIdx >> 6);
+        if (pixel.x < uResolution.x && pixel.y < uResolution.y) {
+            // only the first lane of each subgroup does the global atomic
+            if (subgroupElect()) {
+                // integer atomic - faster than NV float atomic on flush path
+                // scale back to float on read in the display shader
+                imageAtomicAdd(uColorBuffer, pixel, float(reduced));
+            }
+        }
+    }*/
+
+
+    for (int i = 0; i < 16; i++) {
+        int flatIdx = int(threadIdx) * 16 + i;
+        uint tileVal = sTile[flatIdx >> 6][flatIdx & 63];
+        ivec2 pixel = tileBase + ivec2(flatIdx & 63, flatIdx >> 6);
+        if (pixel.x < uResolution.x && pixel.y < uResolution.y) {
+            imageStore(uColorBuffer, pixel, vec4(float(tileVal), 0, 0, 0));
+        }
+    }
+}

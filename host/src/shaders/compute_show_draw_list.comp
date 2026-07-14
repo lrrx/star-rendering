@@ -1,0 +1,31 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(binding = 0, rgba8) uniform writeonly image2D uColorBuffer;
+
+layout(std430, binding = 1) buffer DrawListBuffer {
+    uint drawList[];
+};
+
+vec4 unpackVec4(uint v) {
+    vec4 unpacked;
+    unpacked.x = float((v & uint(0xff000000)) >> 24);
+    unpacked.y = float((v & uint(0x00ff0000)) >> 16);
+    unpacked.z = float((v & uint(0x0000ff00)) >> 8);
+    unpacked.w = float((v & uint(0x000000ff)) >> 0);
+    return unpacked;
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x % 256;
+    uint y = gl_GlobalInvocationID.x / 256;
+
+    uint tileID = drawList[gl_GlobalInvocationID.x];
+
+    ivec2 pixel = ivec2(x, 720 - y);
+
+    vec4 color = unpackVec4(tileID) / 256.f;
+    color.a = 1.0;
+
+    imageStore(uColorBuffer, pixel, color);
+}

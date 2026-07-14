@@ -1,0 +1,43 @@
+// Returns the logarithm to the base 10.
+float log10(float x) {
+  return log(x) / log(10.0);
+}
+
+// Returns the apparent magnitude of a star based on its absolute magnitude and distance in parsecs.
+float getApparentMagnitude(float absMagnitude, float distInParsce) {
+  return absMagnitude + 5.0 * log10(distInParsce / 10.0);
+}
+
+// Formula from https://en.wikipedia.org/wiki/Surface_brightness.
+float magnitudeToLuminance(float apparentMagnitude, float solidAngle) {
+  const float steradiansToSquareArcSecs = 4.25e10;
+  float surfaceBrightness = apparentMagnitude + 2.5 * log10(solidAngle * steradiansToSquareArcSecs);
+  return 10.8e4 * pow(10, -0.4 * surfaceBrightness);
+}
+
+// Maps a value from one range to another.
+float mapRange(float value, float oldMin, float oldMax, float newMin, float newMax) {
+  return newMin + (clamp(value, oldMin, oldMax) - oldMin) * (newMax - newMin) / (oldMax - oldMin);
+}
+
+// Returns the solid angle of the triangle defined by the tips of the vectors a, b and c.
+float getSolidAngle(vec3 a, vec3 b, vec3 c) {
+  return 2 * atan(abs(dot(a, cross(b, c))) / (1 + dot(a, b) + dot(a, c) + dot(b, c)));
+}
+
+// Returns the solid angle of the pixel at screenSpacePosition.
+float getSolidAngleOfPixel(vec4 screenSpacePosition, vec2 resolution, mat4 invProjection) {
+  vec2 pixel           = vec2(1.0) / resolution;
+  vec4 pixelCorners[4] = vec4[4](screenSpacePosition + vec4(-pixel.x, -pixel.y, 0, 0),
+      screenSpacePosition + vec4(+pixel.x, -pixel.y, 0, 0),
+      screenSpacePosition + vec4(+pixel.x, +pixel.y, 0, 0),
+      screenSpacePosition + vec4(-pixel.x, +pixel.y, 0, 0));
+
+  for (int i = 0; i < 4; ++i) {
+    pixelCorners[i]     = invProjection * pixelCorners[i];
+    pixelCorners[i].xyz = normalize(pixelCorners[i].xyz);
+  }
+
+  return getSolidAngle(pixelCorners[0].xyz, pixelCorners[1].xyz, pixelCorners[2].xyz) +
+         getSolidAngle(pixelCorners[0].xyz, pixelCorners[2].xyz, pixelCorners[3].xyz);
+}

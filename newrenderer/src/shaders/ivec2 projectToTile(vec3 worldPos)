@@ -1,0 +1,69 @@
+ivec2 projectToTile(vec3 worldPos) {
+    ivec2 screenPos = toScreen(worldPos);
+    if(screenPos.x < 0) return ivec2(-1);
+
+    return ivec2(floor(screenPos / float(TILE_SIZE)));
+}
+
+
+
+vec3 toWorld(vec3 chunkGlobalPos) {
+    return (vec3(chunkGlobalPos) + vec3(0.5)) * uChunkSize;
+}
+
+ivec2 binToTile(vec3 chunkGlobalPos, ivec2 tileCount) {
+    ivec2 retTile = ivec2(-1);
+    bool hit = false;
+
+    vec4 color = vec4(0.1,0,1,1);
+
+    for(uint i = 8; i < 9; i++) {
+        vec3 offs = vec3(
+            i >> 2 & 1,
+            i >> 1 & 1,
+            i >> 0 & 1
+        );
+
+        if(i == 8) offs = vec3(0.5);
+
+        vec3 cornerGlobalPos = toWorld(chunkGlobalPos + offs - 0.5); 
+
+        ivec2 tile = projectToTile(cornerGlobalPos);
+        if( 0 <= tile.x && tile.x < tileCount.x &&
+            0 <= tile.y && tile.y < tileCount.y && !hit) {
+            retTile = tile;
+            hit = true;
+            color = vec4(0.1,1,0,1);
+        }
+        ivec2 sp = toScreen(cornerGlobalPos);
+        DEBUG_fillPixelThick(ivec2(sp), color);
+    }
+
+    return retTile;
+}
+
+
+
+    ChunkMeta cm = chunkMetas[i];
+
+    // DEBUG: currently restricted to chunks with exactly 2 rows.
+    // Remove both lines to exercise the variable-size slicing path.
+    if (cm.batchCount < 4) return;
+    //if (cm.batchCount > 100) return;
+
+    vec3 chunkGlobalPos = vec3(unpackUvec4(cm.chunkID).yzw) - vec3(127); //TODO 0.5 chunk width shift?
+    vec3 cp = chunkGlobalPos;
+    ivec2 dbg_px_pos = ivec2(cp.xz * 4.0) + ivec2(900.0, 500.0);
+    DEBUG_fillPixelThick(dbg_px_pos + 1, vec4(vec3(0.4), 1.0));
+
+    ivec2 tileCount = ivec2(uResolution) / int(TILE_SIZE);
+    ivec2 tile = binToTile(chunkGlobalPos, tileCount);
+    if (tile.x < 0) return;
+
+    uint tileID_flat = uint(tile.y * tileCount.x + tile.x);
+    
+    DEBUG_fillPixelThick(dbg_px_pos, vec4(1.0, -cp.y /8.0, cp.y / 4.0, 1.0));
+
+    enqueueChunk(tileID_flat, cm);
+
+    //DEBUG_drawVoxelOutline(chunkGlobalPos, 1.0, vec4(0.8,0.5,0,1));

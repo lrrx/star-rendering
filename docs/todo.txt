@@ -1,0 +1,3 @@
+- have naive rendering for low density stars
+- cap stars per chunk at % BATCH_WIDTH == 0(can only be n*BATCH_WIDTH) -> the rest of stars per batch get put into low density chunks, a second pass is done for those
+- with these, also add culling

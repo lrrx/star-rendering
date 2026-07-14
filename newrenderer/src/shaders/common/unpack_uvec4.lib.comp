@@ -1,0 +1,8 @@
+uvec4 unpack_uvec4(uint v) {
+    uvec4 unpacked;
+    unpacked.x = (v & uint(0xff000000)) >> 24;
+    unpacked.y = (v & uint(0x00ff0000)) >> 16;
+    unpacked.z = (v & uint(0x0000ff00)) >> 8;
+    unpacked.w = (v & uint(0x000000ff)) >> 0;
+    return unpacked;
+}

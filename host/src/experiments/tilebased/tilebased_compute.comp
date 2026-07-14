@@ -1,0 +1,103 @@
+#version 460 core
+#extension GL_NV_shader_atomic_float : enable
+
+layout(local_size_x = THREAD_COUNT, local_size_y = 1) in;
+
+layout(binding = 0, r32f) uniform image2D uColorBuffer;
+
+uniform ivec2 uResolution;
+uniform uint uChunkCount;
+
+struct ChunkMeta { //TODO: make all batches of chunk equal size, for workload distribution
+    uint startBatch; //where in batch memory does the first batch start; (1 step = 512 x 512 x 4 bytes)
+    uint batchCount; //how many batches in this chunk
+    uint lastBatchRowCount; //leftover point rows in last batch
+    uint chunkID; //unique location bound id, multiple batches can be assigned to one id
+};
+
+layout(std430, binding = 1) readonly buffer GpuChunkMetaSSBO {
+    ChunkMeta chunkMetas[];
+};
+
+layout(std430, binding = 2) readonly buffer GpuBatchesFlatSSBO {
+    uint batchesFlat[];
+};
+
+shared uint localTile[64][64];
+
+uvec3 decode_morton(uint morton) {
+    uint x = morton;
+    uint y = morton >> 1;
+    uint z = morton >> 2;
+    x &=                   0x09249249u;
+    x = (x ^ (x >>  2)) &  0x030c30c3u;
+    x = (x ^ (x >>  4)) &  0x0f00f00fu;
+    x = (x ^ (x >>  8)) &  0xff0000ffu;
+    x = (x ^ (x >> 16)) &  0x000000ffu;
+    y &=                   0x09249249u;
+    y = (y ^ (y >>  2)) &  0x030c30c3u;
+    y = (y ^ (y >>  4)) &  0x0f00f00fu;
+    y = (y ^ (y >>  8)) &  0xff0000ffu;
+    y = (y ^ (y >> 16)) &  0x000000ffu;
+    z &=                   0x09249249u;
+    z = (z ^ (z >>  2)) &  0x030c30c3u;
+    z = (z ^ (z >>  4)) &  0x0f00f00fu;
+    z = (z ^ (z >>  8)) &  0xff0000ffu;
+    z = (z ^ (z >> 16)) &  0x000000ffu;
+    return uvec3(x, y, z);
+}
+
+void clearTile() {
+    uint lid = gl_LocalInvocationID.x;
+    // clear tile: 4096 cells / 512 threads = 16 cells per thread
+    for (uint i = lid; i < 64u * 64u; i += THREAD_COUNT) {
+        uint x = i & 63u;
+        uint y = i >> 6;
+        localTile[x][y] = 0;
+    }
+}
+
+void flushTile(uvec2 tileBasePx) {
+    uint lid = gl_LocalInvocationID.x;
+    for (uint i = lid; i < 64u * 64u; i += THREAD_COUNT) {
+        uint x = i & 63u;
+        uint y = i >> 6;
+        uvec2 pixel = uvec2(x, y) + tileBasePx;
+        if (pixel.x < uResolution.x && pixel.y < uResolution.y) {
+            float value = float(localTile[x][y]) / 100.0;
+            imageStore(uColorBuffer, ivec2(pixel), vec4(
+                //float(x * y * val) + 
+                value, 0,0,0));
+        }
+    }
+}
+
+void main() {
+    uvec2 wg = gl_WorkGroupID.xy;
+    uint wg_flat = wg.y * gl_NumWorkGroups.x + wg.x;
+    uvec2 tileBasePx = wg * 64;
+
+    clearTile();
+    barrier();
+
+    uint columnID = gl_LocalInvocationID.x;
+
+    ChunkMeta meta = chunkMetas[wg_flat];
+    uint basePtr = meta.startBatch * (BATCH_LENGTH + 1) * THREAD_COUNT;
+    uint baseMorton = batchesFlat[basePtr + columnID];
+    uint currentMorton = baseMorton;
+    
+    uint deltasPtr = basePtr + THREAD_COUNT;
+    for (uint row = 0u; row < BATCH_LENGTH; row++) {
+        uint star = batchesFlat[deltasPtr + row * THREAD_COUNT + columnID];
+        currentMorton += star;
+        uvec2 pos = decode_morton(currentMorton).xy;
+        if (pos.x < 64u && pos.y < 64u) {
+            atomicAdd(localTile[pos.x][pos.y], 1u);
+        }
+    }
+
+    // flush to output image: 4096 pixels / 512 threads = 16 pixels per thread
+    barrier(); //TODO: do we really need this?
+    flushTile(tileBasePx);
+}

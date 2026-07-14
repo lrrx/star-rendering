@@ -1,0 +1,57 @@
+    // Pick one star per tile to print; gate stricter than before
+    if (posEncoded % 599991u == 0u) {
+        ivec2 p = ivec2(tileBasePx) + ivec2(1, 1);
+        const int LH = int(BLIT32_HEIGHT) + 4; // line height
+        const int LX = 5 * int(BLIT32_ADVANCE); // label width (4 chars + colon + space)
+        vec4 c = vec4(1.0);
+
+        // Line 0: "DIST:" observer_distance (parsecs)
+        drawChar(68u, p + ivec2(0*BLIT32_ADVANCE, 0*LH), c); // D
+        drawChar(73u, p + ivec2(1*BLIT32_ADVANCE, 0*LH), c); // I
+        drawChar(83u, p + ivec2(2*BLIT32_ADVANCE, 0*LH), c); // S
+        drawChar(84u, p + ivec2(3*BLIT32_ADVANCE, 0*LH), c); // T
+        drawChar(58u, p + ivec2(4*BLIT32_ADVANCE, 0*LH), c); // :
+        drawInt(int(observer_distance), p + ivec2(LX, 0*LH), false);
+
+        // Line 1: "AMAG:" apparentMagnitude * 100
+        drawChar(65u, p + ivec2(0*BLIT32_ADVANCE, 1*LH), c); // A
+        drawChar(77u, p + ivec2(1*BLIT32_ADVANCE, 1*LH), c); // M
+        drawChar(65u, p + ivec2(2*BLIT32_ADVANCE, 1*LH), c); // A
+        drawChar(71u, p + ivec2(3*BLIT32_ADVANCE, 1*LH), c); // G
+        drawChar(58u, p + ivec2(4*BLIT32_ADVANCE, 1*LH), c); // :
+        drawInt(int(apparentMagnitude * 100.0), p + ivec2(LX, 1*LH), false);
+
+        // Line 2: "SANG:" solidAngle * 1e9
+        drawChar(83u, p + ivec2(0*BLIT32_ADVANCE, 2*LH), c); // S
+        drawChar(65u, p + ivec2(1*BLIT32_ADVANCE, 2*LH), c); // A
+        drawChar(78u, p + ivec2(2*BLIT32_ADVANCE, 2*LH), c); // N
+        drawChar(71u, p + ivec2(3*BLIT32_ADVANCE, 2*LH), c); // G
+        drawChar(58u, p + ivec2(4*BLIT32_ADVANCE, 2*LH), c); // :
+        drawInt(int(solidAngle * 1e9), p + ivec2(LX, 2*LH), false);
+
+        // Line 3: "SBRT:" surfaceBrightness * 100
+        drawChar(83u, p + ivec2(0*BLIT32_ADVANCE, 3*LH), c); // S
+        drawChar(66u, p + ivec2(1*BLIT32_ADVANCE, 3*LH), c); // B
+        drawChar(82u, p + ivec2(2*BLIT32_ADVANCE, 3*LH), c); // R
+        drawChar(84u, p + ivec2(3*BLIT32_ADVANCE, 3*LH), c); // T
+        drawChar(58u, p + ivec2(4*BLIT32_ADVANCE, 3*LH), c); // :
+        drawInt(int(sb_dbg * 100.0), p + ivec2(LX, 3*LH), false);
+
+        // Line 4: "LUMI:" lumi * 1e6
+        drawChar(76u, p + ivec2(0*BLIT32_ADVANCE, 4*LH), c); // L
+        drawChar(85u, p + ivec2(1*BLIT32_ADVANCE, 4*LH), c); // U
+        drawChar(77u, p + ivec2(2*BLIT32_ADVANCE, 4*LH), c); // M
+        drawChar(73u, p + ivec2(3*BLIT32_ADVANCE, 4*LH), c); // I
+        drawChar(58u, p + ivec2(4*BLIT32_ADVANCE, 4*LH), c); // :
+        drawInt(int(lumi * 1e6), p + ivec2(LX, 4*LH), false);
+
+        // Line 5: "TEMP:" raw decoded temperature
+        drawChar(84u, p + ivec2(0*BLIT32_ADVANCE, 5*LH), c); // T
+        drawChar(69u, p + ivec2(1*BLIT32_ADVANCE, 5*LH), c); // E
+        drawChar(77u, p + ivec2(2*BLIT32_ADVANCE, 5*LH), c); // M
+        drawChar(80u, p + ivec2(3*BLIT32_ADVANCE, 5*LH), c); // P
+        drawChar(58u, p + ivec2(4*BLIT32_ADVANCE, 5*LH), c); // :
+        drawInt(int(temp), p + ivec2(LX, 5*LH), false);
+    }    
+
+    return 0;

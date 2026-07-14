@@ -1,0 +1,104 @@
+#version 460 core
+#extension GL_NV_shader_atomic_float : enable
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r32f) uniform image2D uColorBuffer;
+uniform ivec2 uResolution;
+
+struct GpuBatchMeta {
+    uint baseMorton;
+    uint starOffset;
+    uint starCount;
+    uint chunkID;
+};
+
+#define MAX_BATCHES_PER_TILE 256
+struct GpuTileBin {
+    uint batchCount;
+    uint batchIDs[MAX_BATCHES_PER_TILE];
+};
+
+// Explicitly name the SSBO variables
+layout(std430, binding = 0) readonly buffer DeltaStarsSSBO {
+    uint deltaStars[];
+};
+
+layout(std430, binding = 1) readonly buffer BatchMetaSSBO {
+    GpuBatchMeta batches[];
+};
+
+layout(std430, binding = 2) readonly buffer TileBinSSBO {
+    GpuTileBin tiles[];
+};
+
+shared uint sTileWarm[64][64];
+//shared uint sTileCold[64][64];
+
+ivec2 morton2D_decode(uint m) {
+    uint x = m & 0x555u;
+    x = (x | (x >> 1u)) & 0x333u;
+    x = (x | (x >> 2u)) & 0x0F0Fu;
+    x = (x | (x >> 4u)) & 0x00FFu;
+    uint y = (m >> 1u) & 0x555u;
+    y = (y | (y >> 1u)) & 0x333u;
+    y = (y | (y >> 2u)) & 0x0F0Fu;
+    y = (y | (y >> 4u)) & 0x00FFu;
+    return ivec2(int(x), int(y));
+}
+
+void main() {
+    uint threadIdx = gl_LocalInvocationIndex;
+    uint tileID    = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy * 64);
+
+    // Clear shared tile (each thread clears 16 pixels x 2 channels)
+    for (int i = 0; i < 16; i++) {
+        uint flatid = threadIdx * 16u + uint(i);
+        sTileWarm[flatid >> 6][flatid & 63u] = 0u;
+        //sTileCold[flatid >> 6][flatid & 63u] = 0u;
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    GpuTileBin tile = tiles[tileID];
+
+    // Distribute batches across threads round-robin
+    for (uint b = threadIdx; b < tile.batchCount; b += 256u) {
+        uint batchID = tile.batchIDs[b];
+        GpuBatchMeta batch = batches[batchID];
+
+        uint morton = batch.baseMorton;
+
+        for (uint s = 0u; s < batch.starCount; s++) {
+            uint offs = batch.starOffset;
+            uint packed = deltaStars[offs + s];
+            uint delta = packed & 0xff;
+            //uint lWarm = (packed >> 8u) & 0xff;
+            //uint lCold  = (packed >> 16u) & 0xFFu;
+
+            morton += delta;  // accumulate delta
+
+            ivec2 localPx = morton2D_decode(morton & 0xFFFu);
+
+            // Shared atomic - other batches processed by other threads may target the same pixel
+            atomicAdd(sTileWarm[localPx.y][localPx.x], 0.25);
+            //atomicAdd(sTileCold[localPx.y][localPx.x], lCold);
+        }
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    // Flush via imageAtomicAdd using NV float extension
+    for (int i = 0; i < 16; i++) {
+        uint flatid = threadIdx * 16u + uint(i);
+        ivec2 pixel = tileBase + ivec2(flatid & 63u, flatid >> 6);
+        if (pixel.x < uResolution.x && pixel.y < uResolution.y) {
+            float w = float(sTileWarm[flatid >> 6][flatid & 63u]);
+            //float c = float(sTileCold[flatid >> 6][flatid & 63u]);
+            imageAtomicAdd(uColorBuffer, pixel, w);
+        }
+    }
+}

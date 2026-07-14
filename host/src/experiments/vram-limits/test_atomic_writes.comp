@@ -1,0 +1,55 @@
+#version 460 core
+#extension GL_NV_shader_atomic_float : enable
+
+// 256 threads per workgroup, covering a 64x64 tile
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, r32f) uniform image2D uColorBuffer;
+uniform ivec2 uResolution;
+
+// 64x64 tile = 4096 floats = 16KB shared memory
+shared float sTile[64][64];
+
+void main() {
+    ivec2 localID  = ivec2(gl_LocalInvocationID.xy);
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy * 64);
+
+    uint globalHash = uint(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 16 + 256);
+    globalHash ^= globalHash >> 16;
+    globalHash *= 0x45d9f3bu;
+    globalHash ^= globalHash >> 16;
+
+    // each of the 256 threads clears 16 pixels (4096 / 256 = 16)
+    for (int i = 0; i < 16; i++) {
+        int flatIdx = localID.y * 16 + localID.x + i * 256;
+        sTile[flatIdx >> 6][flatIdx & 63] = 0.0;
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    // each thread simulates 64 star splats landing somewhere in the tile
+    // in the real rasterizer, these would be projected star positions
+    // loaded from a per-tile bin
+    for (int i = 0; i < 4096; i++) {
+        uint hash = uint(localID.x + localID.y * 16 + i * 256);
+        hash ^= globalHash;
+        hash ^= hash >> 16;
+        hash *= 0x45d9f3bu;
+        hash ^= hash >> 16;
+        ivec2 target = ivec2(hash & 63u, (hash >> 6u) & 63u);
+        atomicAdd(sTile[target.y][target.x], 1.0);
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    // each thread flushes its 16 pixels to global memory
+    for (int i = 0; i < 16; i++) {
+        int flatIdx = localID.y * 16 + localID.x + i * 256;
+        ivec2 pixel = tileBase + ivec2(flatIdx & 63, flatIdx >> 6);
+        if (pixel.x < uResolution.x && pixel.y < uResolution.y) {
+            imageAtomicAdd(uColorBuffer, pixel, sTile[flatIdx >> 6][flatIdx & 63]);
+        }
+    }
+}

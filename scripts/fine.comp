@@ -1,0 +1,116 @@
+#version 430
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(std430, binding = 0) buffer OutBuf {
+    uint visible;
+    uint interior;
+    uint border;
+};
+layout(std430, binding = 2) readonly buffer FineList {
+    uint cells[];
+};
+
+uniform int  N;
+uniform uint count;
+
+const float FOV_H      = radians(90.0);
+const float ASPECT     = 16.0 / 9.0;
+const float FOV_V      = 2.0 * atan(tan(FOV_H * 0.5) / ASPECT);
+const float HALF_FOV_H = FOV_H * 0.5;
+const float HALF_FOV_V = FOV_V * 0.5;
+const float TAN_ALPHA  = tan(FOV_H * 0.5);
+const float TAN_BETA   = tan(FOV_V * 0.5);
+const int   TILES_X    = 30;
+const int   TILES_Y    = 17;
+const float DX         = FOV_H / float(TILES_X);
+const float DY         = FOV_V / float(TILES_Y);
+
+shared uint sV[512], sI[512], sB[512];
+
+void main() {
+    // 1D logical workgroup index, packed as 2D in dispatch to dodge the
+    // GL minimum work-group-count limit.
+    uint wg = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.y;
+
+    int li = int(gl_LocalInvocationID.x);
+    int lj = int(gl_LocalInvocationID.y);
+    int lk = int(gl_LocalInvocationID.z);
+    int lid = li + 8 * (lj + 8 * lk);
+
+    uint vV = 0u, vI = 0u, vB = 0u;
+
+    if (wg < count) {
+        uint packed = cells[wg];
+        int bi = int( packed         & 0x3FFu);
+        int bj = int((packed >> 10)  & 0x3FFu);
+        int bk = int((packed >> 20)  & 0x3FFu);
+
+        int i = bi*8 + li;
+        int j = bj*8 + lj;
+        int k = bk*8 + lk;
+
+        if (i < N && j < N && k < N) {
+            float halfN = float(N) * 0.5;
+
+            // center pre-cull -- preserved verbatim from the original kernel
+            // so totals match exactly
+            vec3 center = vec3(float(i)+0.5-halfN,
+                               float(j)+0.5-halfN,
+                               float(k)+0.5-halfN);
+            if (center.z > 0.0) {
+                float maxX = abs(center.z) * TAN_ALPHA;
+                float maxY = abs(center.z) * TAN_BETA;
+                if (abs(center.x) <= maxX && abs(center.y) <= maxY) {
+                    vec3 base = vec3(float(i)-halfN,
+                                     float(j)-halfN,
+                                     float(k)-halfN);
+                    bool hasTile = false;
+                    int  firstId = -1;
+                    bool multi   = false;
+                    for (int c = 0; c < 8; c++) {
+                        vec3 cor = base + vec3(float(c & 1),
+                                               float((c >> 1) & 1),
+                                               float((c >> 2) & 1));
+                        if (cor.z > 0.0) {
+                            float tx = atan(cor.x / cor.z);
+                            float ty = atan(cor.y / cor.z);
+                            if (tx > -HALF_FOV_H && tx < HALF_FOV_H &&
+                                ty > -HALF_FOV_V && ty < HALF_FOV_V) {
+                                int ix = int((tx + HALF_FOV_H) / DX);
+                                int iy = int((ty + HALF_FOV_V) / DY);
+                                if (ix >= 0 && ix < TILES_X &&
+                                    iy >= 0 && iy < TILES_Y) {
+                                    int id = iy * TILES_X + ix;
+                                    if (!hasTile) { hasTile = true; firstId = id; }
+                                    else if (id != firstId) multi = true;
+                                }
+                            }
+                        }
+                    }
+                    if (hasTile) {
+                        vV = 1u;
+                        if (multi) vB = 1u; else vI = 1u;
+                    }
+                }
+            }
+        }
+    }
+
+    sV[lid] = vV; sI[lid] = vI; sB[lid] = vB;
+    barrier();
+
+    for (uint stride = 256u; stride > 0u; stride >>= 1) {
+        if (uint(lid) < stride) {
+            sV[lid] += sV[lid + stride];
+            sI[lid] += sI[lid + stride];
+            sB[lid] += sB[lid + stride];
+        }
+        barrier();
+    }
+
+    if (lid == 0) {
+        atomicAdd(visible,  sV[0]);
+        atomicAdd(interior, sI[0]);
+        atomicAdd(border,   sB[0]);
+    }
+}

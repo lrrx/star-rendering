@@ -1,0 +1,346 @@
+#version 460 core
+
+const ivec2 TILE_GRID_DIMENSIONS = ivec2(TILES_X, TILES_Y);
+
+layout(local_size_x = 64) in;
+
+struct ChunkMeta {
+    uint startBatch;
+    uint batchCount;       // bounded to MAX_CHUNK_ROWS by CPU preprocessing
+    uint lastBatchRowCount;
+    uint chunkID;
+};
+
+// One job = one tile workgroup processing a list of <= MAX_JOB_CHUNKS chunks.
+// A hot tile spawns extra jobs via the tip-pointer chain in DispatchHeader.
+struct Job {
+    uint count;            // chunks written so far (atomic, sealed at MAX_JOB_CHUNKS)
+    uint id_per_tile;      // 0,1,2... in this tile's chain (debug/profile)
+    uint tileID_flat;
+    uint pad0;
+    ChunkMeta list[MAX_JOB_CHUNKS];
+};
+
+// First 16 B are the indirect dispatch args + pad; tip_pointers follow.
+// Same buffer is bound as GL_SHADER_STORAGE_BUFFER (binding 5) and
+// GL_DISPATCH_INDIRECT_BUFFER for the rasterize pass.
+struct DispatchHeader {
+    uint x_count;        // == total jobs (primaries + overflow)
+    uint y_count;        // == 1
+    uint z_count;        // == 1
+    uint pad0;
+    uint tip_pointers[NUM_PRIMARY_TILES];      // per-tile current write target
+};
+
+layout(std430, binding = 1) readonly buffer GpuChunkMetaSSBO { ChunkMeta chunkMetas[]; };
+layout(std430, binding = 2) coherent  buffer GpuJobSSBO       { Job joblist[]; };
+layout(std430, binding = 5) coherent  buffer GpuDispatchHeaderSSBO { DispatchHeader dh; };
+
+layout(binding = 1, rgba8) coherent uniform image2D uFrameBuffer;
+
+uniform uint    uShowMask;
+uniform uint    uChunkCount;
+uniform mat4    uViewProj;
+uniform mat4    uMatModel;
+uniform ivec2   uResolution;
+uniform float   uChunkSize;
+uniform float   uTime;
+const float uParsecToMeter = 3.08567758e16;
+
+#include "common/unpack_uvec4.lib.comp"
+
+ivec2 toScreen(vec3 pos) {
+    vec4 clip = uViewProj * uMatModel * vec4(pos * uParsecToMeter, 1.0);
+
+    if (clip.w <= 0.0) return ivec2(-1);
+
+    vec2 ndc    = clip.xy / clip.w;
+    vec2 screen = (ndc * 0.5 + 0.5) * vec2(uResolution);
+
+    return ivec2(screen);
+}
+
+ivec2 projectToTile(vec3 chunkGlobalPos, float chunkScale) {
+    vec3 worldCenter = (vec3(chunkGlobalPos) + vec3(0.5)) * uChunkSize * chunkScale;
+    ivec2 screenPos = toScreen(worldCenter);
+    if(screenPos.x < 0) return ivec2(-1);
+
+    return ivec2(floor(screenPos / float(TILE_SIZE)));
+}
+
+#define ENABLE_DRAWLIST_DEBUG
+#ifdef ENABLE_DRAWLIST_DEBUG
+#include "common/debugdraw.lib.comp"
+
+void DEBUG_drawVoxelOutline(vec3 cellPos, float cellSize, vec4 color, float chunkScale)
+{
+    // half‑extent
+    vec3 h = vec3(cellSize * 0.5);
+    cellPos += h;
+
+    // 8 cube corners
+    vec3 corner[8];
+    corner[0] = cellPos + vec3(-h.x, -h.y, -h.z); // 000
+    corner[1] = cellPos + vec3(+h.x, -h.y, -h.z); // 100
+    corner[2] = cellPos + vec3(+h.x, +h.y, -h.z); // 110
+    corner[3] = cellPos + vec3(-h.x, +h.y, -h.z); // 010
+
+    corner[4] = cellPos + vec3(-h.x, -h.y, +h.z); // 001
+    corner[5] = cellPos + vec3(+h.x, -h.y, +h.z); // 101
+    corner[6] = cellPos + vec3(+h.x, +h.y, +h.z); // 111
+    corner[7] = cellPos + vec3(-h.x, +h.y, +h.z); // 011
+
+    // project to screen
+    ivec2 pixelCorner[8];
+    for (int i = 0; i < 8; i++)
+        pixelCorner[i] = toScreen(corner[i] * uChunkSize * chunkScale);
+
+    // 12 cube edges (pairs of indices)
+    const ivec2 edges[12] = ivec2[12](
+        ivec2(0,1), ivec2(1,2), ivec2(2,3), ivec2(3,0), // bottom face
+        ivec2(4,5), ivec2(5,6), ivec2(6,7), ivec2(7,4), // top face
+        ivec2(0,4), ivec2(1,5), ivec2(2,6), ivec2(3,7)  // vertical edges
+    );
+
+    // draw all edges
+    for (int e = 0; e < 12; e++)
+    {
+        ivec2 a = pixelCorner[edges[e].x];
+        ivec2 b = pixelCorner[edges[e].y];
+
+        if (a.x < 0 || b.x < 0) continue; // clipping rule
+
+        DEBUG_drawLine(a, b, color);
+    }
+}
+#endif
+
+// Extract the 6 frustum planes from uViewProj, expressed in the same
+// coordinate space as the AABB inputs below (i.e. pre-uParsecToMeter).
+// Planes are (nx,ny,nz,d); inside = n·p + d >= 0.
+void extractFrustumPlanes(mat4 vp, out vec4 planes[6]) {
+    mat4 s = mat4(uParsecToMeter, 0.0, 0.0, 0.0,
+                  0.0, uParsecToMeter, 0.0, 0.0,
+                  0.0, 0.0, uParsecToMeter, 0.0,
+                  0.0, 0.0, 0.0,         1.0);
+    mat4 m = vp * uMatModel * s;
+
+    // GLSL is column-major: m[i] is column i. Grab rows manually.
+    vec4 r0 = vec4(m[0][0], m[1][0], m[2][0], m[3][0]);
+    vec4 r1 = vec4(m[0][1], m[1][1], m[2][1], m[3][1]);
+    vec4 r2 = vec4(m[0][2], m[1][2], m[2][2], m[3][2]);
+    vec4 r3 = vec4(m[0][3], m[1][3], m[2][3], m[3][3]);
+
+    planes[0] = r3 + r0;  // left
+    planes[1] = r3 - r0;  // right
+    planes[2] = r3 + r1;  // bottom
+    planes[3] = r3 - r1;  // top
+    planes[4] = r3 + r2;  // near
+    planes[5] = r3 - r2;  // far
+}
+
+// Conservative AABB-vs-frustum (positive-vertex test).
+// Returns true if the AABB intersects or is inside the frustum.
+bool aabbInFrustum(vec3 aabbMin, vec3 aabbMax, vec4 planes[6]) {
+    for (int i = 0; i < 6; ++i) {
+        vec3 n = planes[i].xyz;
+        // Pick the corner of the AABB most aligned with the plane normal.
+        vec3 p = mix(aabbMin, aabbMax, step(vec3(0.0), n));
+        if (dot(n, p) + planes[i].w < 0.0) return false;
+    }
+    return true;
+}
+
+// Pick ONE on-screen tile to assign this chunk's work to. The choice
+// doesn't affect correctness (the rasterizer scatters writes); it only
+// affects work distribution. Project the center if we can, otherwise
+// fall back to the screen-center tile so near-plane-crossing chunks
+// still land somewhere valid.
+ivec2 pickAssignmentTile(vec3 chunkGlobalPos, float chunkScale) {
+    vec3 worldCenter = (chunkGlobalPos + vec3(0.5)) * uChunkSize * chunkScale;
+    vec4 clip = uViewProj * uMatModel * vec4(worldCenter * uParsecToMeter, 1.0);
+
+    vec2 ndc    = clip.xy / clip.w;
+    vec2 screen = (ndc * 0.5 + 0.5) * vec2(uResolution);
+    ivec2 tile  = ivec2(floor(screen / float(TILE_SIZE)));
+
+    if (clip.w > 0.0) {
+        if (tile.x >= 0 && tile.x < TILE_GRID_DIMENSIONS.x &&
+            tile.y >= 0 && tile.y < TILE_GRID_DIMENSIONS.y) {
+            return tile;
+        }
+    }
+
+    return clamp(tile, ivec2(0,0), TILE_GRID_DIMENSIONS - ivec2(1));   //REVEAL(fallback: middle tile vs. clamped screen edges, bad workload balancing)
+}
+
+//used to check if chunks reach such an apparent size that they require high precision star coordinates
+float estimateOnscreenSize(vec3 chunkGlobalPos, float chunkScale) {
+    float side = uChunkSize * chunkScale;
+    vec3  base = chunkGlobalPos * side;
+
+    vec2 mn = vec2( 1e30);
+    vec2 mx = vec2(-1e30);
+
+    for (int c = 0; c < 8; ++c) {
+        vec3 corner = base + vec3(c & 1, (c >> 1) & 1, (c >> 2) & 1) * side;
+        vec4 clip   = uViewProj * uMatModel * vec4(corner * uParsecToMeter, 1.0);
+
+        if (clip.w <= 0.0) return 1e30;    // near straddle -> huge -> high precision
+
+        vec2 px = clip.xy / clip.w * 0.5 * vec2(uResolution);  // +0.5 offset cancels in min/max diff
+        mn = min(mn, px);
+        mx = max(mx, px);
+    }
+
+    vec2 ext = mx - mn;              // screen-space width & height
+    return max(ext.x, ext.y) / sqrt(2.0);
+}
+
+// Append `data` to the tile's current job list. If the job is full, the unique
+// thread that observed slot == MAX_JOB_CHUNKS (only possible with +1 atomic
+// increments) allocates the next job and publishes the new tip. Others retry.
+void enqueueChunk(uint tileID_flat, ChunkMeta data) {
+    for (uint retry = 0u; retry < 256u; ++retry) {
+        //uint hash = uint(abs(sin(((retry * tileID_flat * data.chunkID) ^ tileBasePx.x) ^ tileBasePx.y)) * float(0xffffffff));
+        //if(retry < 128 && (hash % 10) > 1) continue;
+        uint job  = dh.tip_pointers[tileID_flat];
+        uint slot = atomicAdd(joblist[job].count, 1u);
+
+        if (slot < MAX_JOB_CHUNKS) {
+            joblist[job].list[slot] = data;
+            return;
+        }
+
+        // Job is full. Settle our increment back so count stops growing
+        // unboundedly (rasterize clamps via min() anyway, but tidy is nice).
+        //atomicAdd(joblist[job].count, 0xFFFFFFFFu); // -1
+        //REVEAL(reenable to provoke race condition, drawlist generation)
+
+        // Unique winner: exactly one thread sees slot == MAX_JOB_CHUNKS,
+        // because increments are +1. Late arrivals (slot > MAX_JOB_CHUNKS)
+        // just spin until the new tip is published.
+        if (slot == MAX_JOB_CHUNKS) {
+            uint prevId = joblist[job].id_per_tile;
+            uint newJob = atomicAdd(dh.x_count, 1u);
+            if (newJob < MAX_JOBS) {
+                joblist[newJob].count       = 0u;
+                joblist[newJob].id_per_tile = prevId + 1u;
+                joblist[newJob].tileID_flat = tileID_flat;
+                joblist[newJob].pad0        = 0u;
+                memoryBarrierBuffer();
+                atomicExchange(dh.tip_pointers[tileID_flat], newJob);
+            }
+            // else: out of job buffer; subsequent retries also fail and drop.
+        }
+    }
+}
+
+bool pseudorandomChunkSelect(uint chunkID) {
+    return (((chunkID * 31571953) ^ chunkID << 7) % 100 == 0);
+}
+
+bool chunkInFrustum(vec3 chunkGlobalPos, float chunkScale) {
+    // World-space AABB of this chunk (pre-uParsecToMeter, parsec units).
+    vec3 aabbMin =  chunkGlobalPos          * uChunkSize * chunkScale;
+    vec3 aabbMax = (chunkGlobalPos + 1.0)   * uChunkSize * chunkScale;
+
+    vec4 planes[6];
+    extractFrustumPlanes(uViewProj, planes);
+
+    return aabbInFrustum(aabbMin, aabbMax, planes);
+}
+
+#ifdef DEBUG_GRID_OVERLAY
+void DEBUG_grid_overlay(uint i) {
+    if(i < NUM_PRIMARY_TILES) {
+        ivec2 tileBasePx = ivec2(i % TILE_GRID_DIMENSIONS.x, i / TILE_GRID_DIMENSIONS.y) * TILE_SIZE;
+        DEBUG_draw2dBox(tileBasePx, TILE_SIZE, true, vec4(0.4,0.5,1.0,1) * 0.5);
+    }
+}
+#endif
+
+//#define DEBUG_GRID_OVERLAY //REVEAL(drawlist tiles grid overlay)
+//#define DEBUG_VISUALIZE_BINNING //REVEAL(drawlist tiles binning overlay)
+//#define DEBUG_CULLING_MINIMAP //REVEAL(drawlist minimap overlay)
+//#define DEBUG_VISUALIZE_LOD_RADIUS //REVEAL(drawlist: onscreen-size / radius based LOD switch)
+
+//TODO: pull all the debug ifdefs and visualizations into extra pass, exclude from drawlist generation
+//since it's all post-generation anyways. to debug e.g. the parallel job binning algorithm, it would make sense, but not for this
+
+void main() {
+    uint global_thread_id = gl_GlobalInvocationID.x;
+
+#ifdef DEBUG_GRID_OVERLAY
+    DEBUG_grid_overlay(global_thread_id);
+#endif
+
+    if (global_thread_id >= uChunkCount) return;
+
+    ChunkMeta cm = chunkMetas[global_thread_id];
+    uint chunkScale = (cm.chunkID >> 24) & 0x7F;
+    if((chunkScale & uShowMask) == 0) return;
+
+    if (cm.batchCount == 0) return;
+    //if (cm.batchCount > 100) return; //REVEAL(load balancing, upper limit of rows per chunk)
+
+    vec3 chunkGlobalPos = vec3(unpack_uvec4(cm.chunkID).yzw) - vec3(127); //TODO 0.5 chunk width shift?
+    //if(length(chunkGlobalPos * chunkScale) <= 0.75) return;
+    
+#ifdef DEBUG_CULLING_MINIMAP
+    ivec2 dbg_px_pos = ivec2(chunkGlobalPos.xz * 4.0 * chunkScale) + ivec2(600, 600);
+    DEBUG_fillPixelThick(2 * chunkScale, dbg_px_pos + 1, vec4(vec3(0.4), 1.0));
+#endif
+
+    if(!chunkInFrustum(chunkGlobalPos, chunkScale)) return;
+
+#ifdef DEBUG_CULLING_MINIMAP
+    DEBUG_fillPixelThick(2 * chunkScale, dbg_px_pos, vec4(1.0, -chunkGlobalPos.y /8.0, chunkGlobalPos.y / 4.0, 1.0));
+#endif
+
+    ivec2 tile = pickAssignmentTile(chunkGlobalPos, chunkScale);
+
+    //REVEAL(limit of high-LOD loading distance/screensize of chunks)
+    //set to high precision if chunk large enough in on-screen pixels
+    float onScreenRadius = estimateOnscreenSize(chunkGlobalPos, chunkScale);
+    uint flagged_as_requiring_high_lod = (onScreenRadius > HIGH_LOD_PX_THRESHOLD) ? 1 : 0;
+    cm.chunkID |= flagged_as_requiring_high_lod << 31; //set "high-precision" bit
+
+    uint tileID_flat = uint(tile.y * TILE_GRID_DIMENSIONS.x + tile.x);
+    enqueueChunk(tileID_flat, cm);
+
+    ivec2 chunkOnScreenPos = toScreen((chunkGlobalPos + 0.5) * uChunkSize * chunkScale);
+
+#ifdef DEBUG_VISUALIZE_LOD_RADIUS
+    bool debugShowRadius = pseudorandomChunkSelect(cm.chunkID) && chunkScale > 10;
+
+    if(debugShowRadius) { //REVEAL(screen area radius limit deduction from circular radius)
+        vec4 color = vec4(1, 0, 1, 1);
+        if(onScreenRadius > HIGH_LOD_PX_THRESHOLD) {
+            color = vec4(1, 0, 0, 1);
+            onScreenRadius = HIGH_LOD_PX_THRESHOLD;
+        }
+        DEBUG_drawVoxelOutline(chunkGlobalPos, 1.0, vec4(0.8,0.5,0,1), chunkScale);
+        DEBUG_drawCircle(chunkOnScreenPos, onScreenRadius, color);
+    }
+#endif
+
+#ifdef DEBUG_VISUALIZE_BINNING
+    if(tileID_flat % 37 == 0) {
+        ivec2 tileBasePx = tile * TILE_SIZE;
+        ivec2 tileMidPx = tileBasePx + TILE_SIZE / 2;
+
+        if(chunkOnScreenPos.x >= 0 && tileMidPx.x < uResolution.x - TILE_SIZE && tileMidPx.y < uResolution.y - TILE_SIZE) {
+            
+            DEBUG_drawVoxelOutline(chunkGlobalPos, 1.0, vec4(0.8,0.5,0,1), chunkScale);
+            DEBUG_drawCross(chunkOnScreenPos, 8, vec4(1,0,0,1));
+            DEBUG_drawLine(chunkOnScreenPos, tileMidPx, vec4(1,0,0,1));
+
+            const vec4 col2 = vec4(0.1,1,0,1);
+
+            DEBUG_drawCross(tileMidPx, 16, col2);
+            DEBUG_draw2dBox(tileBasePx, TILE_SIZE, false, col2);
+        }
+    }
+#endif
+}

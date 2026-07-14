@@ -1,0 +1,53 @@
+{
+    "version": 10,
+    "configurePresets": [
+        {
+            "name": "msvc-debug",
+            "description": "MSVC (Visual Studio 17 2022) – Debug",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/msvc-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "msvc-release",
+            "description": "MSVC (Visual Studio 17 2022) – Release",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/msvc-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "clang-debug",
+            "description": "Clang (Ninja) – Debug (Linux only)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/clang-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "/usr/bin/clang",
+                "CMAKE_CXX_COMPILER": "/usr/bin/clang++"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "msvc-debug",
+            "configurePreset": "msvc-debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "msvc-release",
+            "configurePreset": "msvc-release",
+            "configuration": "Release" 
+        },
+        {
+            "name": "clang-debug",
+            "configurePreset": "clang-debug",
+            "configuration": "Debug" 
+        }
+    ]
+}

@@ -1,0 +1,11 @@
+Draw List Generation / Culling:
+    - generate draw list on-gpu under 500 us
+    - how to generate voxel draw list index for shapes more complex than quad (e.g. triangle stripe unrolling) analitically in O(1)
+
+Cache Optimization:
+    - a) local SM tile blending, then VRAM upload, shared across warp cores
+    - blending in second pass (render to tile atlas first and then 3d compose impostors?) or option a) instead?
+
+LOD:
+    - Voxel 2D impostor for (90%,50%,20% e.g. per LOD level) of dimest stars (light distribution or perhaps occasionally updated texture sprite)
+    - only draw brightest x% stars, the rest is a gaussian or an infreuquently updated texture

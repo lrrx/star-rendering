@@ -1,0 +1,43 @@
+#version 460
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 1) buffer DrawListBuffer {
+    uint drawList[];
+};
+
+// Simple Linear Congruential Generator (LCG) for randomness
+uint hash(uint x)
+{
+    x ^= 2747636419u;
+    x = (x ^ (x >> 12)) * 2725800275u;
+    x ^= (x >> 12) + 86962877u;
+    return x;
+}
+
+// Pseudo-random number based on seed and index
+uint random(uint seed, uint idx)
+{
+    uint n = seed + idx * 2654435761u; // Prime multiplier for good distribution
+    n = (n ^ (n >> 16)) * 2246822507u;
+    n ^= (n >> 13) + 3266489909u;
+    return n;
+}
+
+void main()
+{
+    const uint instanceCount = 256 * 256;
+    const uint seed = 42;
+
+    uint idx = gl_GlobalInvocationID.x;
+    
+    //if (idx >= instanceCount) return;
+    
+    // Generate pseudo-random byte values
+    uint r = random(seed, idx * 4u + 0u) & 0xFFu;
+    uint g = random(seed, idx * 4u + 1u) & 0xFFu;
+    uint b = random(seed, idx * 4u + 2u) & 0xFFu;
+    uint a = 0xFFu;
+    
+    // Store in random data array (each uint holds 4 bytes packed)
+    drawList[idx] = (idx << 8) | 0xFFu;//(r << 24) | (g << 16) | (b << 8) | a;
+}
